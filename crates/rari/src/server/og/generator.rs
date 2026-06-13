@@ -45,6 +45,20 @@ impl OgImageGenerator {
         }
     }
 
+    pub fn with_capacity_and_cache(
+        runtime: Arc<JsExecutionRuntime>,
+        project_path: PathBuf,
+        cache: OgImageCache,
+    ) -> Self {
+        Self {
+            runtime,
+            cache,
+            manifest: Arc::new(RwLock::new(FxHashMap::default())),
+            project_path,
+            server_manifest: Arc::new(RwLock::new(FxHashMap::default())),
+        }
+    }
+
     pub async fn load_manifest(&self, manifest_path: &str) -> Result<(), OgImageError> {
         let content = tokio::fs::read_to_string(manifest_path)
             .await
@@ -103,7 +117,7 @@ impl OgImageGenerator {
         const MAX_OG_WIDTH: u32 = 2400;
         const MAX_OG_HEIGHT: u32 = 1260;
 
-        if let Some(cached) = self.cache.get(route_path) {
+        if let Some(cached) = self.cache.get(route_path).await {
             return Ok((cached, true));
         }
 
@@ -139,7 +153,7 @@ impl OgImageGenerator {
         let webp_data = Self::encode_webp(&image)
             .map_err(|e| OgImageError::GenerationError(format!("Failed to encode WebP: {}", e)))?;
 
-        self.cache.insert(route_path.to_string(), webp_data.clone());
+        self.cache.insert(route_path.to_string(), webp_data.clone()).await;
 
         Ok((webp_data, false))
     }
@@ -372,12 +386,12 @@ impl OgImageGenerator {
     }
 
     #[cfg(test)]
-    pub fn clear_cache(&self) {
-        self.cache.clear();
+    pub async fn clear_cache(&self) {
+        self.cache.clear().await;
     }
 
-    pub fn invalidate(&self, route_path: &str) {
-        self.cache.remove(route_path);
+    pub async fn invalidate(&self, route_path: &str) {
+        self.cache.remove(route_path).await;
     }
 }
 

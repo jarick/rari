@@ -57,7 +57,9 @@ pub async fn revalidate_by_path(
                 }
             }
 
-            state.layout_html_cache.clear();
+            if let Err(e) = state.layout_html_cache.clear().await {
+                tracing::warn!("layout_html_cache.clear failed: {}", e);
+            }
 
             #[allow(clippy::disallowed_methods)]
             Ok(Json(RevalidateResponse {

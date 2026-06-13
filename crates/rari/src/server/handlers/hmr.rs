@@ -226,7 +226,9 @@ async fn handle_register(state: ServerState, file_path: String) -> Result<Json<V
             }
         }
 
-        state.layout_html_cache.clear();
+        if let Err(e) = state.layout_html_cache.clear().await {
+            tracing::warn!("layout_html_cache.clear failed: {}", e);
+        }
 
         serde_json::json!({
             "success": true,

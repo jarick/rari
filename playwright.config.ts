@@ -17,10 +17,13 @@ export default defineConfig({
   },
 
   webServer: {
-    command: 'pnpm --filter @test/app build && pnpm --filter @test/app start',
+    command: `pnpm --filter @test/app build && pnpm --filter @test/app start > "${process.env.RARI_LOG_FILE ?? './target/rari-web.log'}" 2>&1`,
     url: `http://localhost:${process.env.PORT || 3000}`,
     reuseExistingServer: !process.env.CI,
     timeout: 120000,
+    env: {
+      RUST_LOG: 'debug',
+    },
   },
 
   projects: [

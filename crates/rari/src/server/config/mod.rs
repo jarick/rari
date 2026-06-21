@@ -88,6 +88,7 @@ impl Default for CacheLayerConfig {
             handler: "memory".to_string(),
             url: None,
             max_entries: 1000,
+            url: None,
             default_ttl_secs: 60,
         }
     }

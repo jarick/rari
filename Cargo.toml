@@ -31,6 +31,9 @@ categories = [
   "web-programming::http-server"
 ]
 
+[workspace.lints.rust]
+linker_messages = "allow"
+
 [workspace.lints.clippy]
 # Restriction rules for better code quality
 allow_attributes = "deny"

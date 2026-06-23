@@ -1274,6 +1274,11 @@ export default registerClientReference(null, ${JSON.stringify(componentId)}, "de
       serverConfig.useCache = {
         remote: this.options.experimental.useCacheRemote,
       }
+      if (!this.options.experimental.useCache) {
+        console.warn(
+          '[server-build] experimental.useCacheRemote is set without experimental.useCache; enabling experimental.useCache implicitly.',
+        )
+      }
     }
 
     const serverConfigPath = path.join(

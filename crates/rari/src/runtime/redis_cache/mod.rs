@@ -1,3 +1,5 @@
+#![allow(clippy::exhaustive_structs)]
+
 use deno_core::{Extension, OpState, extension, op2};
 use deno_error::JsErrorBox;
 use redis::AsyncCommands;
@@ -13,9 +15,11 @@ const DEFAULT_TTL_SECS: u64 = 60;
 const MS_PER_SEC: u64 = 1_000;
 const REDIS_TIMEOUT: Duration = Duration::from_secs(2);
 
+pub const TEST_REDIS_URL: &str = "redis://localhost:6379";
+
 extension!(
     rari_redis_cache,
-    ops = [op_cache_remote_get, op_cache_remote_set],
+    ops = [op_redis_cache_get, op_redis_cache_set],
     options = {},
     state = |state, _options| {
         state.put(Arc::new(RedisCacheState::from_config()));
@@ -43,11 +47,19 @@ impl RedisCacheState {
         let remote = crate::server::config::Config::get()
             .and_then(|config| config.use_cache.remote.as_ref());
 
-        let url = remote.and_then(|remote| remote.url.clone());
-        let default_ttl_secs =
-            remote.map(|remote| remote.default_ttl_secs).unwrap_or(DEFAULT_TTL_SECS);
+        let url = remote.and_then(|r| match r.handler.as_str() {
+            "test" => Some(TEST_REDIS_URL.to_string()),
+            _ => r.url.clone(),
+        });
+        let default_ttl_secs = remote
+            .map(|remote| remote.default_ttl_secs)
+            .unwrap_or(DEFAULT_TTL_SECS);
 
-        Self { url, default_ttl_secs, connection: Mutex::new(None) }
+        Self {
+            url,
+            default_ttl_secs,
+            connection: Mutex::new(None),
+        }
     }
 
     async fn connection(&self) -> Result<redis::aio::MultiplexedConnection, RedisCacheError> {
@@ -65,18 +77,19 @@ impl RedisCacheState {
             tokio::time::timeout(REDIS_TIMEOUT, client.get_multiplexed_async_connection())
                 .await
                 .map_err(|_| {
-                RedisCacheError::Connect(redis::RedisError::from((
-                    redis::ErrorKind::IoError,
-                    "redis connect timeout",
-                )))
-            })??;
-        *connection = Some(new_connection);
+                    RedisCacheError::Connect(redis::RedisError::from((
+                        redis::ErrorKind::Io,
+                        "redis connect timeout",
+                    )))
+                })??;
+        *connection = Some(new_connection.clone());
 
-        Ok(connection.as_ref().expect("redis connection was just initialized").clone())
+        Ok(new_connection)
     }
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RedisCacheError {
     #[error("redis cache state is not initialized")]
     StateMissing,
@@ -87,7 +100,10 @@ pub enum RedisCacheError {
 }
 
 fn ttl_ms_to_secs(ttl_ms: u32) -> u64 {
-    (ttl_ms as u64).saturating_add(MS_PER_SEC - 1).saturating_div(MS_PER_SEC).max(1)
+    u64::from(ttl_ms)
+        .saturating_add(MS_PER_SEC - 1)
+        .saturating_div(MS_PER_SEC)
+        .max(1)
 }
 
 fn js_error(error: impl std::fmt::Display) -> JsErrorBox {
@@ -106,12 +122,16 @@ async fn get_redis_state(
 
 #[op2]
 #[string]
-pub async fn op_cache_remote_get(
+pub async fn op_redis_cache_get(
     state: Rc<RefCell<OpState>>,
     #[string] key: String,
 ) -> Result<Option<String>, JsErrorBox> {
-    let mut connection =
-        get_redis_state(state).await.map_err(js_error)?.connection().await.map_err(js_error)?;
+    let mut connection = get_redis_state(state)
+        .await
+        .map_err(js_error)?
+        .connection()
+        .await
+        .map_err(js_error)?;
     let raw: Option<Vec<u8>> = tokio::time::timeout(REDIS_TIMEOUT, connection.get(&key))
         .await
         .map_err(|_| js_error("redis get timeout"))?
@@ -120,7 +140,7 @@ pub async fn op_cache_remote_get(
 }
 
 #[op2]
-pub async fn op_cache_remote_set(
+pub async fn op_redis_cache_set(
     state: Rc<RefCell<OpState>>,
     #[string] key: String,
     #[string] value: String,
@@ -128,12 +148,19 @@ pub async fn op_cache_remote_set(
 ) -> Result<(), JsErrorBox> {
     let redis_state = get_redis_state(state).await.map_err(js_error)?;
     let mut connection = redis_state.connection().await.map_err(js_error)?;
-    let ttl_secs = if ttl_ms == 0 { redis_state.default_ttl_secs } else { ttl_ms_to_secs(ttl_ms) };
-    tokio::time::timeout(
-        REDIS_TIMEOUT,
-        connection.set_ex::<_, _, ()>(&key, value.into_bytes(), ttl_secs),
-    )
-    .await
-    .map_err(|_| js_error("redis set timeout"))?
-    .map_err(js_error)
+    let ttl_secs = if ttl_ms == 0 {
+        redis_state.default_ttl_secs
+    } else {
+        ttl_ms_to_secs(ttl_ms)
+    };
+    let bytes = value.into_bytes();
+    let fut: redis::RedisFuture<'_, ()> = if ttl_secs == 0 {
+        connection.set::<_, _, ()>(&key, bytes)
+    } else {
+        connection.set_ex::<_, _, ()>(&key, bytes, ttl_secs)
+    };
+    tokio::time::timeout(REDIS_TIMEOUT, fut)
+        .await
+        .map_err(|_| js_error("redis set timeout"))?
+        .map_err(js_error)
 }

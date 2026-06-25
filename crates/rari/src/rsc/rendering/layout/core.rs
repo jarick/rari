@@ -49,7 +49,7 @@ impl LayoutHtmlCache {
     }
 
     pub fn from_config(layer: &CacheLayerConfig, registry: &CacheHandlerRegistry) -> Self {
-        let handler = registry.resolve(&layer.handler);
+        let handler = registry.resolve_for_layer(layer);
         Self::with_ttl(handler, layer.default_ttl_secs)
     }
 

@@ -142,7 +142,7 @@ impl Server {
         let cache_registry = Arc::new(CacheHandlerRegistry::from_env());
 
         let response_layer = config.cache.layer(CACHE_LAYER_RESPONSE);
-        let response_handler = cache_registry.resolve(&response_layer.handler);
+        let response_handler = cache_registry.resolve_for_layer(&response_layer);
         let cache_config = response::CacheConfig::from_env(config.is_production());
         let response_cache = Arc::new(response::ResponseCache::new_with_handler(
             cache_config,
@@ -150,10 +150,10 @@ impl Server {
         ));
 
         let image_layer = config.cache.layer(CACHE_LAYER_IMAGE);
-        let image_handler = cache_registry.resolve(&image_layer.handler);
+        let image_handler = cache_registry.resolve_for_layer(&image_layer);
 
         let og_layer = config.cache.layer(CACHE_LAYER_OG);
-        let og_handler = cache_registry.resolve(&og_layer.handler);
+        let og_handler = cache_registry.resolve_for_layer(&og_layer);
 
         let og_generator = {
             let runtime = Arc::clone(&js_runtime);

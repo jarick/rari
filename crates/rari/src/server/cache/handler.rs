@@ -20,6 +20,14 @@ use parking_lot::Mutex;
 
 pub use async_trait::async_trait;
 
+#[cfg(feature = "redb")]
+use super::redb_handler::RedbCacheHandler;
+#[cfg(feature = "redis")]
+use super::redis_handler::RedisCacheHandler;
+#[cfg(all(feature = "redis", feature = "redb"))]
+use super::test_handler::TestCacheHandler;
+use crate::server::config::CacheLayerConfig;
+
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum CacheError {
@@ -53,9 +61,13 @@ pub trait CacheHandler: Send + Sync + fmt::Debug {
 
     async fn invalidate(&self, key: &str) -> Result<bool, CacheError>;
 
-    async fn invalidate_by_tag(&self, tag: &str) -> Result<(), CacheError>;
+    async fn invalidate_by_tag(&self, _tag: &str) -> Result<(), CacheError> {
+        Ok(())
+    }
 
-    async fn clear(&self) -> Result<(), CacheError>;
+    async fn clear(&self) -> Result<(), CacheError> {
+        Ok(())
+    }
 
     async fn clear_prefix(&self, prefix: &str) -> Result<usize, CacheError> {
         let keys = self.get_all_keys();
@@ -428,14 +440,6 @@ impl CacheHandler for NoOpCacheHandler {
         Ok(false)
     }
 
-    async fn invalidate_by_tag(&self, _tag: &str) -> Result<(), CacheError> {
-        Ok(())
-    }
-
-    async fn clear(&self) -> Result<(), CacheError> {
-        Ok(())
-    }
-
     fn get_all_keys(&self) -> Vec<String> {
         Vec::new()
     }
@@ -463,8 +467,11 @@ impl CacheHandlerRegistry {
 
     pub fn default_with_memory() -> Self {
         let registry = Self::new();
-        registry.register("memory", Arc::new(MemoryCacheHandler::default()));
-        registry.register("noop", Arc::new(NoOpCacheHandler));
+        let memory: Arc<dyn CacheHandler> = Arc::new(MemoryCacheHandler::default());
+        registry.register("memory", Arc::clone(&memory));
+        let noop: Arc<dyn CacheHandler> = Arc::new(NoOpCacheHandler);
+        registry.register("noop", Arc::clone(&noop));
+        registry.register("none", noop);
         registry
     }
 
@@ -496,12 +503,49 @@ impl CacheHandlerRegistry {
             Arc::clone(&entry)
         })
     }
+
+    pub fn resolve_for_layer(&self, layer: &CacheLayerConfig) -> Arc<dyn CacheHandler> {
+        match layer.handler.as_str() {
+            "memory" => self
+                .get(&layer.handler)
+                .unwrap_or_else(|| self.fallback_memory()),
+            "noop" | "none" => self
+                .get(&layer.handler)
+                .unwrap_or_else(|| self.fallback_memory()),
+            #[cfg(all(feature = "redis", feature = "redb"))]
+            "test" => Arc::new(TestCacheHandler::from_config(layer)),
+            #[cfg(feature = "redis")]
+            "redis" => Arc::new(RedisCacheHandler::from_config(layer)),
+            #[cfg(feature = "redb")]
+            "redb" => Arc::new(RedbCacheHandler::from_config(layer)),
+            other => {
+                if let Some(handler) = self.get(other) {
+                    handler
+                } else {
+                    tracing::warn!(
+                        configured = %other,
+                        "configured cache handler not registered; falling back to memory"
+                    );
+                    self.fallback_memory()
+                }
+            }
+        }
+    }
+
+    fn fallback_memory(&self) -> Arc<dyn CacheHandler> {
+        let entry = self
+            .handlers
+            .entry("memory".to_owned())
+            .or_insert_with(|| Arc::new(MemoryCacheHandler::default()) as Arc<dyn CacheHandler>);
+        Arc::clone(&entry)
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use crate::server::config::{CACHE_LAYER_LAYOUT, default_cache_layers};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -672,5 +716,201 @@ mod tests {
         let resolved = registry.resolve("custom");
         resolved.set("k", b"v".to_vec(), 60).await.unwrap();
         assert_eq!(resolved.get("k").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_default_with_memory_registers_none_alias_for_noop() {
+        let registry = CacheHandlerRegistry::default_with_memory();
+        let noop = registry.get("noop").expect("noop must be registered");
+        let none = registry.get("none").expect("none must be registered");
+        noop.set("k", b"v".to_vec(), 60).await.unwrap();
+        assert_eq!(none.get("k").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_for_layer_none_handler_disables_caching() {
+        let registry = CacheHandlerRegistry::default_with_memory();
+        let layer = CacheLayerConfig {
+            handler: "none".to_string(),
+            url: None,
+            max_entries: 1,
+            default_ttl_secs: 60,
+        };
+        let handler = registry.resolve_for_layer(&layer);
+        handler.set("k", b"v".to_vec(), 60).await.unwrap();
+        assert_eq!(handler.get("k").await.unwrap(), None);
+        assert!(!handler.invalidate("k").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_for_layer_uses_memory_for_layout() {
+        let registry = CacheHandlerRegistry::default_with_memory();
+        let mut layers = default_cache_layers();
+        layers
+            .get_mut(CACHE_LAYER_LAYOUT)
+            .expect("layout layer")
+            .handler = "memory".to_string();
+        let layer = layers
+            .get(CACHE_LAYER_LAYOUT)
+            .expect("layout layer")
+            .clone();
+
+        let handler = registry.resolve_for_layer(&layer);
+        handler.set("layout-key", b"v".to_vec(), 60).await.unwrap();
+        assert_eq!(
+            handler.get("layout-key").await.unwrap(),
+            Some(b"v".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_for_layer_unknown_handler_falls_back_to_memory() {
+        let registry = CacheHandlerRegistry::default_with_memory();
+        let layer = CacheLayerConfig {
+            handler: "no-such-handler".to_string(),
+            url: None,
+            max_entries: 1,
+            default_ttl_secs: 60,
+        };
+        let handler = registry.resolve_for_layer(&layer);
+        handler.set("k", b"v".to_vec(), 60).await.unwrap();
+        assert_eq!(handler.get("k").await.unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[cfg(feature = "redb")]
+    #[tokio::test]
+    async fn test_resolve_for_layer_creates_redb_handler() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cache.redb").to_string_lossy().to_string();
+        let registry = CacheHandlerRegistry::default_with_memory();
+        let layer = CacheLayerConfig {
+            handler: "redb".to_string(),
+            url: Some(path),
+            max_entries: 1,
+            default_ttl_secs: 60,
+        };
+
+        let handler = registry.resolve_for_layer(&layer);
+        handler.set("redb-k", b"hello".to_vec(), 60).await.unwrap();
+        assert_eq!(
+            handler.get("redb-k").await.unwrap(),
+            Some(b"hello".to_vec())
+        );
+        assert!(handler.invalidate("redb-k").await.unwrap());
+        assert_eq!(handler.get("redb-k").await.unwrap(), None);
+    }
+
+    #[cfg(feature = "redb")]
+    #[tokio::test]
+    async fn test_resolve_for_layer_redb_clear_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cache.redb").to_string_lossy().to_string();
+        let registry = CacheHandlerRegistry::default_with_memory();
+        let layer = CacheLayerConfig {
+            handler: "redb".to_string(),
+            url: Some(path),
+            max_entries: 1,
+            default_ttl_secs: 60,
+        };
+
+        let handler = registry.resolve_for_layer(&layer);
+        handler.set("layout:a", b"1".to_vec(), 60).await.unwrap();
+        handler.set("layout:b", b"2".to_vec(), 60).await.unwrap();
+        handler.set("other:c", b"3".to_vec(), 60).await.unwrap();
+
+        let removed = handler.clear_prefix("layout:").await.unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(handler.get("layout:a").await.unwrap(), None);
+        assert_eq!(handler.get("layout:b").await.unwrap(), None);
+        assert_eq!(handler.get("other:c").await.unwrap(), Some(b"3".to_vec()));
+    }
+
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    async fn test_resolve_for_layer_redis_without_url_returns_error_on_use() {
+        let registry = CacheHandlerRegistry::default_with_memory();
+        let layer = CacheLayerConfig {
+            handler: "redis".to_string(),
+            url: None,
+            max_entries: 1,
+            default_ttl_secs: 60,
+        };
+
+        let handler = registry.resolve_for_layer(&layer);
+        let err = handler.get("k").await.unwrap_err();
+        assert!(
+            err.to_string().contains("not configured"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(all(feature = "redis", feature = "redb"))]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_resolve_for_layer_test_handler_without_backend_returns_error() {
+        use crate::server::cache::test_handler::{current_backend, reset_test_backend};
+
+        reset_test_backend();
+        assert_eq!(current_backend(), None);
+
+        let registry = CacheHandlerRegistry::default_with_memory();
+        let layer = CacheLayerConfig {
+            handler: "test".to_string(),
+            url: None,
+            max_entries: 1,
+            default_ttl_secs: 60,
+        };
+
+        let handler = registry.resolve_for_layer(&layer);
+        let err = handler.get("k").await.unwrap_err();
+        assert!(
+            err.to_string().contains("test cache backend not set"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(all(feature = "redis", feature = "redb"))]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_resolve_for_layer_test_handler_dispatches_to_redb() {
+        use crate::server::cache::test_handler::{
+            TestCacheBackend, reset_test_backend, set_test_backend,
+        };
+
+        reset_test_backend();
+        set_test_backend(TestCacheBackend::Redb);
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let redb_path = tmp.path().join("test.redb");
+        let registry = CacheHandlerRegistry::default_with_memory();
+        let layer = CacheLayerConfig {
+            handler: "test".to_string(),
+            url: Some(redb_path.to_string_lossy().to_string()),
+            max_entries: 1,
+            default_ttl_secs: 60,
+        };
+
+        let handler = registry.resolve_for_layer(&layer);
+        handler.set("k", b"v".to_vec(), 60).await.unwrap();
+        assert_eq!(handler.get("k").await.unwrap(), Some(b"v".to_vec()));
+        assert!(handler.invalidate("k").await.unwrap());
+        assert_eq!(handler.get("k").await.unwrap(), None);
+
+        reset_test_backend();
+    }
+
+    #[cfg(all(feature = "redis", feature = "redb"))]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_test_handler_set_then_reset_backend_switches_dispatch() {
+        use crate::server::cache::test_handler::{
+            TestCacheBackend, current_backend, reset_test_backend, set_test_backend,
+        };
+
+        reset_test_backend();
+        set_test_backend(TestCacheBackend::Redb);
+        assert_eq!(current_backend(), Some(TestCacheBackend::Redb));
+        reset_test_backend();
+        assert_eq!(current_backend(), None);
     }
 }

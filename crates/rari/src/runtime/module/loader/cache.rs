@@ -55,7 +55,7 @@ impl ModuleCaching {
     }
 
     pub fn from_config(layer: &CacheLayerConfig, registry: &CacheHandlerRegistry) -> Self {
-        let handler = registry.resolve(&layer.handler);
+        let handler = registry.resolve_for_layer(layer);
         Self::with_handler(layer.max_entries, layer.default_ttl_secs, handler)
     }
 
